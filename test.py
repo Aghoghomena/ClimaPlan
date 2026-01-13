@@ -38,15 +38,15 @@
 
 import requests
 import pandas as pd
+from datetime import datetime
 
 
 url = "https://archive-api.open-meteo.com/v1/archive"
 params = {
     "latitude": 53.3331,
     "longitude": -6.2489,
-    "start_date": "2022-01-01",
-    "end_date": "2022-01-07",
-    "hourly": "",
+    "start_date": "2016-01-12",
+    "end_date": "2026-01-12",
     "daily": "temperature_2m_max,temperature_2m_min,precipitation_sum,windspeed_10m_max,shortwave_radiation_sum",
     "timezone": "Europe/Dublin",
 }
@@ -83,9 +83,19 @@ df = pd.DataFrame(weather_list)
 
 df["date"] = pd.to_datetime(df["date"])
 df["doy"] = df["date"].dt.dayofyear
-print(df)
 
-data_window = 7
-target_doy = pd.Timestamp("2025-01-12").dayofyear
+data_window = 5
+target_doy = pd.Timestamp("2026-01-12").dayofyear
+lower = target_doy - data_window
+upper = target_doy + data_window
+
+if lower < 1:
+    baseline = df[(df["doy"] >= 366 + lower) | (df["doy"] <= upper)]
+elif upper > 366:
+    baseline = df[(df["doy"] >= lower) | (df["doy"] <= upper - 366)]
+else:
+    baseline = df[(df["doy"] >= lower) & (df["doy"] <= upper)]
+
+print(baseline)
 
 

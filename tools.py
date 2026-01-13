@@ -3,6 +3,7 @@ import requests
 from datetime import datetime
 import time
 import os
+import pandas as pd
 
 mcp = FastMCP("climate_report")
 
@@ -76,9 +77,54 @@ def get_weather_for_today(latitude: float, longitude: float) -> dict:
     except Exception as e:
         return {"error": str(e)}
 
+@mcp.tool()
+def filter_historical_data(historical_data: dict) -> dict:
+    """
+    Processes historical weather data to compute average temperature and total precipitation.
+
+    Args:
+        historical_data (dict): Raw historical weather data.
+    Returns:
+        dict: Processed data with the baseline weather data needed.
+    """
+    try:
+        weather_list = []
+        daily = historical_data["daily"]
+
+        for date, tmax, tmin, rain in zip(
+            daily["time"],
+            daily["temperature_2m_max"],
+            daily["temperature_2m_min"],
+            daily["precipitation_sum"],
+        ):
+            weather_list.append({
+                "date": date,
+                "temp_max": tmax,
+                "temp_min": tmin,
+                "precipitation": rain,
+            })
+           # Create DataFrame and get day of year
+        df = pd.DataFrame(weather_list)
+        df["date"] = pd.to_datetime(df["date"])
+        df["doy"] = df["date"].dt.dayofyear
+
+        # Create baseline data window
+        data_window = 5
+        current_date = datetime.now().strftime('%Y-%m-%d')
+        target_doy = pd.Timestamp(current_date).dayofyear
+        lower = target_doy - data_window
+        upper = target_doy + data_window
+
+        if lower < 1:
+            baseline = df[(df["doy"] >= 366 + lower) | (df["doy"] <= upper)]
+        elif upper > 366:
+            baseline = df[(df["doy"] >= lower) | (df["doy"] <= upper - 366)]
+        else:
+            baseline = df[(df["doy"] >= lower) & (df["doy"] <= upper)]
+        return baseline.to_dict(orient="records")
+    except Exception as e:
+        return {"error": str(e)}
 
 
 if __name__ == "__main__":
-    # Remove try/except - let FastMCP handle errors properly
-    # Don't print anything to stdout - it breaks JSON-RPC
     mcp.run(transport="stdio")
