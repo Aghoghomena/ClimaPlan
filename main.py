@@ -1,19 +1,12 @@
 # import MessagesState
-from click import prompt
 from langgraph.graph import StateGraph, START, END
-from langgraph.graph import MessagesState
 import os
-from langchain_google_genai import ChatGoogleGenerativeAI
-from dotenv import load_dotenv
-from langchain_mcp_adapters.client import MultiServerMCPClient
 from langgraph.prebuilt import ToolNode, InjectedState
 from langchain.messages import HumanMessage, SystemMessage, AnyMessage
 from pydantic import BaseModel,Field, ValidationError, field_validator
 from typing import Optional, Dict, Any, List, Annotated
 from langchain.messages import ToolMessage
 from utility import _tool_content_to_dict,parse_mcp_text_result , weather_data_to_df,_parse_payload, parse_mcp,get_baseline_code
-from langchain_groq import ChatGroq
-from langchain_core.runnables import RunnableConfig
 from langgraph.graph.message import add_messages 
 import json
 import sys as system
@@ -21,160 +14,33 @@ from datetime import datetime, timedelta
 from guardrails import Guard
 from guardrails.errors import ValidationError as GuardrailsValidationError
 from guardrails.types import OnFailAction
-import re
 import pandas as pd
 import numpy as np
 from langchain_core.tools import tool
 from langsmith import traceable
 import random
 import builtins
-from langchain_core.runnables import RunnableConfig
+import re
 from langgraph.types import interrupt
-
+from prompts import get_graph_system_prompt, format_weather_prompt,get_prompt_subgraph2,get_fix_code_prompt,get_compute_baseline_prompt,get_recommendation_prompt, get_reflection_prompt, get_final_output_prompt
+from models import (
+    WeatherState,
+    UserLocationSchema,
+    WeatherAnalysisOutPut,
+    WeatherAnalysis,
+    Recommendation,
+    Reflections,
+    RecommendationState
+)
 import asyncio
-load_dotenv()
-api_key = os.getenv("GEMINI_API_KEY")
-api_key2= os.getenv("GEMINI_API_KEY2")
-api_base = os.getenv("GEMINI_API_BASE")
-model = os.getenv("GEMINI_API_MODEL")
-groq_api_key = os.getenv("GROQ_API_KEY")
-
-# Validate required environment variables
-if not all([api_key, model, api_key2]):
-    raise ValueError("Missing required environment variables: GEMINI_API_KEY, GEMINI_API_MODEL")
-
-# Initialize the Google Generative AI LLM
-# llm = ChatGoogleGenerativeAI(
-#     model=model,
-#     google_api_key=api_key,
-#     temperature=0
-# )
-
-
-# Alternatively, initialize the Groq LLM
-llm = ChatGroq(
-    model="llama-3.1-8b-instant",
-    groq_api_key=os.getenv("GROQ_API_KEY"),
-    temperature=0.2
-)
-
-# Initialize the MCP client
-mcp_client  = MultiServerMCPClient(
-    {
-        "climate_report_srv": {
-            "transport": "stdio",
-            "command": "uv",
-            "args": ["run", "python", "tools.py"],
-        },
-         "open_meteo": {
-            "transport": "stdio",
-            "command": "python",
-            "args": ["filter_open_meteo.py"],
-             "env": {
-                "OPEN_METEO_ARCHIVE_API_URL": "https://archive-api.open-meteo.com"
-             }
-        },
-        "weather": {
-            "transport": "stdio",
-            "command": "python",
-            "args": ["-m", "mcp_weather_server"],
-        }
-        
-
-    }
-)
-
-
-
-
-class WeatherState(BaseModel):
-    retries: int = 0
-    messages: Annotated[ list[AnyMessage], add_messages] = []
-    latitude: Optional[float] = None
-    longitude: Optional[float] = None
-    city: str | None = None
-    country: str | None = None
-    today_weather: Optional[Dict[str, Any]] = None
-    formated_today_weather: str | None = None
-    hist_weather: Optional[Any] = None  # keep flexible (list/dict) depending on your MCP tool
-    ready_to_format: bool = False 
-    Error: str | None = None
-    generated_code: str | None = None
-    analysis: str | None = None
-    anomaly: Optional [Dict[str, Any]] = None
-    stats: Optional [Dict[str, Any]] = None
-    recommendations: Optional[List[str]] = None
-    final_output: str | None = None
-
-    
-
-    # final strict output (as dict)
-    final: Optional[Dict[str, Any]] = None
-
-class UserLocationSchema(BaseModel):
-    latitude: float = Field(..., ge=-90, le=90)
-    longitude: float = Field(..., ge=-180, le=180)
-    city: str | None = None
-    country: str | None = None
-
-class WeatherAnalysisOutPut(BaseModel):
-    analysis: str
-    anomaly: Dict[str, Any]          # e.g. {"temp_anomaly_c": 1.2, "precip_anomaly_mm": -0.3, ...}
-    stats: Dict[str, Any] 
-
-class WeatherAnalysis(BaseModel):
-    analysis: str | None = None
-    anomaly: Dict[str, Any]  = None       # e.g. {"temp_anomaly_c": 1.2, "precip_anomaly_mm": -0.3, ...}
-    stats: Dict[str, Any] = None
-    hist_weather: Optional[Any] = None 
-    generated_code: str | None = None
-    messages: Annotated[list[AnyMessage], add_messages] = []
-    hist_file_path: Optional[str] = None
-    execution_retries: int = 0  # Track retries for code execution
-    max_execution_retries: int = 3  # Max retries for execution
-    last_error: Optional[str] = None  # Store last error message
-
-class Recommendation(BaseModel):
-    recommendations: List[str] = Field(description="General advice based on the weather where to go what to eat, what to wear.")
-    safety_notes: List[str] = Field(description="Safety/health/travel notes if any.")
-    recommendation_summary: List[str] = Field(description="Summary of reccomendation, outfit_suggestions, safety_notes.")
-    Error: str | None = None
-
-class Reflections(BaseModel):
-    recommendations: List[str] = Field(description="General advice based on the weather where to go what to eat, what to wear.")
-    safety_notes: List[str] = Field(description="Safety/health/travel notes if any.")
-    recommendation_summary: List[str] = Field(description="Summary of reccomendation, outfit_suggestions, safety_notes.")
-    Error: str | None = None
-    reflection_notes: str = Field(description="Notes about what was reflected/improved") 
-    improvements: str = Field(description="Specific suggestions to improve the recommender")
-
-# Add state model for recommendation subgraph (around line 147, after Reflections)
-class RecommendationState(BaseModel):
-    today_weather: Optional[Dict[str, Any]] = None
-    formated_today_weather: Optional[str] = None
-    original_recommendations: Optional[Recommendation] = None
-    reflected_recommendations: Optional[Reflections] = None
-    final_recommendations: Optional[List[str]] = None
-    user_decision: Optional[str] = None  # "apply" or "keep_original"
-    reflection_notes: Optional[str] = None
-    messages: Annotated[list[AnyMessage], add_messages] = []
-    Error: Optional[str] = None
+from config import llm, mcp_client
+from langgraph.checkpoint.memory import MemorySaver
+from langchain_core.runnables import RunnableConfig
 
 
 # Configuration for file saving
 STORAGE_DIR = "data"  # Directory to save files
 FILE_FORMAT = "csv"  # Default format: csv, parquet, or json
-
-# System prompt to guide the LLM to call tools in sequence
-system_prompt = """You are a helpful weather assistant. When a user asks about weather, you should:
-
-1. First, call the `get_user_location` tool to get the user's current location (latitude and longitude)
-2. Then, use the latitude and longitude from the location result to call `get_weather_for_today` tool. 
-3. Finally, provide a friendly response about the weather based on the data you received
-
-Always call get_user_location first, then get_weather_for_today with the coordinates from the location data."""
-
-
 
 
 # -----------------------------
@@ -207,9 +73,21 @@ def route_after_execution(state: WeatherAnalysis) -> str:
 # GuardRails
 # -----------------------------
 location_guard = Guard.for_pydantic(UserLocationSchema)
+# -----------------------------
+# GuardRails
+# -----------------------------
     
 
+# -----------------------------
+# Configurable
+# -----------------------------
 
+checkpointer = MemorySaver()
+
+
+# -----------------------------
+# Configurable
+# -----------------------------
 
 
 # -----------------------------
@@ -346,18 +224,8 @@ async def create_graph():
         city = state.city
         country = state.country
 
-        formatting_prompt = HumanMessage(
-            content=(
-                "Write a friendly, human-readable weather summary for a regular person. "
-                "Describe how it feels (cold/warm), whether it's windy, rainy, or sunny. "
-                "Use the location if available.\n\n"
-                f"Location: {city}, {country}\n"
-                f"Weather data: {weather_data}"
-            )
-        )
-
         # Create a prompt that includes the weather data and asks for formatting
-        formatted_result = await llm.ainvoke([formatting_prompt])
+        formatted_result = await llm.ainvoke([format_weather_prompt(city=city, country=country, weather_data=weather_data)])
          # Extract the content from the LLM response
         formatted_content = formatted_result.content if hasattr(formatted_result, 'content') else str(formatted_result)
     
@@ -435,7 +303,7 @@ async def create_graph():
                 }
             
     #final format to give an output for the user
-    async def final_output(state: WeatherState) -> str:
+    async def final_output(state: WeatherState) -> dict:
         try:
             # Extract data from state
             recommendations = state.recommendations or []
@@ -455,24 +323,8 @@ async def create_graph():
             else:
                 anomaly_text = "No significant anomalies detected"
 
-            # Create prompt for final output
-            final_prompt = f"""Create a comprehensive, cohesive weather report that combines all the information below.
-                    Location: {location}
-                    Weather Analysis:{analysis}
-                    Statistical Summary:{json.dumps(analysis, indent=2) if analysis else "No statistics available"}
-                    Anomalies Detected:{anomaly_text}
-                    Recommendations:{recs_text}
-
-                    Generate a well-structured, easy-to-read final report that:
-                    1. Summarizes the current weather situation
-                    2. Explains the analysis findings
-                    3. Highlights any anomalies or unusual patterns
-                    4. Provides clear, actionable recommendations
-                    5. Is friendly and accessible to a general audience
-
-                    Keep it concise but comprehensive."""
             # Generate final output using LLM
-            final_result = await llm.ainvoke([HumanMessage(content=final_prompt)])
+            final_result = await llm.ainvoke([HumanMessage(content=get_final_output_prompt(location=location, analysis=analysis, stats=analysis, anomaly=anomaly_text, recommendations= recs_text))])
             final_content = final_result.content if hasattr(final_result, 'content') else str(final_result)
             return{"final_output": final_content,
                    "messages": [HumanMessage(content=final_content)]}
@@ -594,35 +446,6 @@ except Exception as e:
 # -----------------------------
 #CodeACt to compute and do the analysis
 
-
-CODEACT_PROMPT = """
-You are an expert Python programmer and data scientist.
-
-Your task:
-1) Understand the data at the file path
-2) generate python code to cmpute anomaly, median, mean and percentile of historical data against todays weather
-   - Reads the CSV file from the file_path provided
-   - Identify the row with the date today using:
-     The column that has date of today
-     Else treat the MAX(date/time) as today (latest timestamp)
-   - For each numeric weather metric column (all numeric columns except obvious IDs):
-     * Compute baseline statistics over historical rows: mean, median, std (sample std), min, max
-     * Compute z_score = (today - mean) / std if std > 0 else null
-     * Compute anomaly flag:
-       - "high" if z_score >= +2
-       - "low" if z_score <= -2
-       - else null
-3) IMPORTANT: After writing the code, you MUST call the execute_code tool with your Python code as the argument.
-
-
-RULES:
-NEVER write tool calls in text. Do NOT output <function=...> ... </function>.
-When you need to use a tool, use the available tools [execute_code].
-If you output <function=...>, that is an error.
-
-"""
-
-
 def fix_generated_code(state: WeatherAnalysis) -> dict:
     """Adjust code based on error message and regenerate"""
     MAX_RETRIES = 3
@@ -638,18 +461,8 @@ def fix_generated_code(state: WeatherAnalysis) -> dict:
     
     # Create a message asking to fix the code based on the error
     error_msg = state.last_error or "Unknown error"
-    adjustment_prompt = f"""
-    The previous code execution failed with this error: {error_msg}
-
-    1. Fix the issue with this{state.generated_code}
-    2. you have access to all pythons Library.
-    3. Return the corrected code
-
-    Generate the corrected Python code and call execute_code tool with it.
-    """
-    
     # Add the error message to conversation
-    msgs = state.messages + [HumanMessage(content=adjustment_prompt)]
+    msgs = state.messages + [HumanMessage(content=get_fix_code_prompt( error_msg=error_msg, generated_code=state.generated_code))]
     
     # Bind tools and generate adjusted code
     llm_with_tools = llm.bind_tools([execute_code])
@@ -728,7 +541,7 @@ def generate_code_node(state: WeatherAnalysis) -> dict:
         # Get messages from state, or create initial messages if empty
         if not state.messages:
             msgs= [
-            SystemMessage(content=CODEACT_PROMPT),
+            SystemMessage(content=get_prompt_subgraph2()),
             HumanMessage(content=f" Understand the data stored in :{state.hist_file_path} and generate Python code, no comments .")
         ]
 
@@ -742,7 +555,7 @@ def generate_code_node(state: WeatherAnalysis) -> dict:
         updated_messages = msgs + [result]
         return {
             "messages": updated_messages,
-            "generated_code":json.dumps(result.tool_calls[0]['args'].get('code', '')),
+            "generated_code":json.dumps(re.sub(r"```.*?\n|```", "", result.content).strip()),
         }
     except Exception as e:
         error_msg = f"Failed at generate code: {e}"
@@ -798,15 +611,11 @@ def execute_code(code: str) -> str:
 def compute_baseline_directly(state: WeatherAnalysis) -> dict:
     """After 3 retries failed, ask LLM to compute baseline directly from the file path"""
     try:
-        analysis_prompt = f"""Analyze the weather data from this CSV file and compute baseline statistics:
-        File path: {state.hist_file_path}
-        Read the file, compute baseline statistics, identify anomalies, and provide your analysis."""
-        
         # Use LLM with structured output
         structured_llm = llm.with_structured_output(WeatherAnalysisOutPut)
         
         result = structured_llm.invoke([
-            HumanMessage(content=analysis_prompt)
+            HumanMessage(content=get_compute_baseline_prompt(hist_file_path=state.hist_file_path))
         ])
         
         return {
@@ -897,23 +706,7 @@ def recommend_for_weather(state: RecommendationState)-> dict:
                     "Error": "No weather data available",
                     "recommendations": []
                 }
-            prompt = f"""
-            You generate practical weather-based recommendations You have the following details.
-            Weather today:
-            - Temp (C): {weather_data["temperature"]}
-            - is_day: {weather_data["is_day"]}
-            - Windspeed (kph): {weather_data["windspeed"]}
-            - Windspeed Direction: {weather_data["winddirection"]}
-            - interval: {weather_data["interval"]}
-
-            Return concise bullets for:
-            1) recommendations
-            3) safety_notes
-            4) recommendation_summary
-            Only use info implied by the weather above.
-            """
-
-            out: Recommendation = llm.with_structured_output(Recommendation).invoke(prompt)
+            out: Recommendation = llm.with_structured_output(Recommendation).invoke(get_recommendation_prompt(weather_data=weather_data))
             # Update state using attribute access (Pydantic model)
             return {
                 "original_recommendations": out
@@ -933,26 +726,7 @@ def reflect_on_recommendations(state: RecommendationState) -> dict:
             }
         orig = state.original_recommendations
 
-        reflection_prompt = f"""
-            You are writing reflection notes about the quality of recommendations.
-            The weather for today is {state.formated_today_weather}
-
-            Original Recommendations: {orig.recommendations}
-            Original Safety Notes: {orig.safety_notes}
-            Original Summary: {orig.recommendation_summary}
-
-            Analyze and provide:
-            1. reflection_notes: A detailed analysis - what assumptions were made, what could be wrong, what info might be missing (e.g. humidity, precipitation chance), and how confident we are.
-            2. improvements: Specific suggestions to improve the recommender (inputs to add, rules to include, personalization ideas).
-            3. Analyze the safety notes - are they really safe tips? Is there any reason the results are fake or hallucination?
-            4. Generate improved recommendations: recommendations (list of strings), safety_notes (list of strings), recommendation_summary (list of strings)
-
-            Return all fields in the required format. Keep it concise and actionable.
-
-            """
-        print(reflection_prompt)
-
-        out: Reflections = llm.with_structured_output(Reflections).invoke(reflection_prompt)
+        out: Reflections = llm.with_structured_output(Reflections).invoke(get_reflection_prompt(formated_today_weather=state.formated_today_weather, original_recommendations=orig))
               # Create a message asking user if they want to apply the reflection
         reflection_message = f"""
                             Reflection completed. Here's what was improved:
@@ -1060,9 +834,7 @@ async def main():
         print("\nGraph saved as weather_graph.png")
     except Exception as e:
         print(f"\nCould not save PNG (pygraphviz may not be installed): {e}")
-    messages = [SystemMessage(content=system_prompt),
-            HumanMessage(content="What's the weather today?")]
-    result = await compiled_graph.ainvoke({"messages": messages})
+    result = await compiled_graph.ainvoke({"messages": get_graph_system_prompt()})
 # -----------------------------
 # Starting Point of the code
 # -----------------------------
