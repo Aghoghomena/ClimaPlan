@@ -9,7 +9,7 @@
 ![License](https://img.shields.io/badge/License-MIT-green?style=flat)
 ![Status](https://img.shields.io/badge/Status-In%20Development-yellow?style=flat)
 
-> **A farmer asks: "Should I plant today?"**
+> **A Person asks: "What should I wear today or were can i go today?"**
 > ClimaPlan auto-detects their location, pulls a decade of weather history, spots anomalies, and delivers a plain-language answer — with safety tips and outfit suggestions — in one command.
 
 ---

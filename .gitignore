@@ -12,3 +12,4 @@ wheels/
 *.png
 data/
 *.csv
+.DS_Store
