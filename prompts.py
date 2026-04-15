@@ -2,13 +2,22 @@ from typing import Any, Optional, Mapping
 from langchain.messages import HumanMessage, SystemMessage, AnyMessage
 import json
 def get_graph_system_prompt()-> str:
-    system_prompt = """You are a helpful weather assistant. When a user asks about weather, you should:
+    system_prompt = """You are a helpful weather assistant using the ReAct (Reasoning and Acting) pattern:
 
-    1. First, call the `get_user_location` tool to get the user's current location (latitude and longitude)
-    2. Then, use the latitude and longitude from the location result to call `get_weather_for_today` tool. 
-    3. Finally, provide a friendly response about the weather based on the data you received
 
-    Always call get_user_location first, then get_weather_for_today with the coordinates from the location data."""
+    Available tools:
+    1. get_user_location - Get the user's current location (latitude and longitude)
+    2. get_weather_for_today - Get today's weather using latitude and longitude in your messages the (latitude and longitude) gotten from get_user_location
+
+    Your task:
+    1. Think step by step about what information you need
+    2. Use the appropriate tools you exposed to you to gather weather information
+    3. Call get_user_location first to get coordinates
+    4. Then call get_weather_for_today with those coordinates(Latitude and longtitude)
+    6. Once you have the data, provide a summary
+
+    Think carefully about which tool to call and when. Use tools to gather information before making conclusions."""
+
     messages = [SystemMessage(content=system_prompt),
             HumanMessage(content="What's the weather today?")]
     return messages
@@ -44,8 +53,10 @@ def get_prompt_subgraph2() -> str:
             - "high" if z_score >= +2
             - "low" if z_score <= -2
             - else null
-        3) IMPORTANT: After writing the code, you MUST call the execute_code tool with your Python code as the argument.
+        3) CRITICAL: You MUST call the execute_code tool with your Python code as the argument. This is REQUIRED.
 
+        Available tools:
+        1. execute_code Runs the generated code this should be called after generate_code_node. call with the code as a string execute_code(code="your_python_code_here")
 
         RULES:
         NEVER write tool calls in text. Do NOT output <function=...> ... </function>.
@@ -77,7 +88,6 @@ def get_recommendation_prompt(weather_data: dict) -> str:
     """Prompt for generating weather recommendations"""
     return f"""
             You generate practical weather-based recommendations You have the following details.
-            Weather today:
             - Temp (C): {weather_data["temperature"]}
             - is_day: {weather_data["is_day"]}
             - Windspeed (kph): {weather_data["windspeed"]}
@@ -91,11 +101,12 @@ def get_recommendation_prompt(weather_data: dict) -> str:
             Only use info implied by the weather above.
             """
 
-def get_reflection_prompt(formated_today_weather: str, original_recommendations: Any) -> str:
+def get_reflection_prompt(weather_data: dict, original_recommendations: Any) -> str:
     """Prompt for reflecting on recommendations"""
+    weather_data_str = json.dumps(weather_data, indent=2) if isinstance(weather_data, dict) else str(weather_data)
     return f"""
             You are writing reflection notes about the quality of recommendations.
-            The weather for today is {formated_today_weather}
+            The weather for today is {weather_data_str}
 
             Original Recommendations: {original_recommendations.recommendations}
             Original Safety Notes: {original_recommendations.safety_notes}
@@ -111,20 +122,21 @@ def get_reflection_prompt(formated_today_weather: str, original_recommendations:
 
             """
 
-def get_final_output_prompt(location: str, analysis: str, stats: dict, anomaly: str, recommendations: list) -> str:
+def get_final_output_prompt(location: str, analysis: str, stats: dict, anomaly: str, recommendations: list,weather_data:dict ) -> str:
     """Prompt for generating final cohesive output"""
     anomaly_text = json.dumps(anomaly, indent=2) if anomaly else "No anomalies detected"
-    recs_text = "\n".join(f"- {rec}" for rec in recommendations) if recommendations else "No recommendations available"
+    weather_data_str = json.dumps(weather_data, indent=2) if isinstance(weather_data, dict) else str(weather_data)
     
-    return f"""Create a comprehensive, cohesive weather report that combines all the information below.
+    return f"""Create a comprehensive, cohesive weather report that combines all the information below in laymans term it should be in a friendly, human-readable format for a regular person.
                     Location: {location}
                     Weather Analysis:{analysis}
                     Statistical Summary:{json.dumps(stats, indent=2) if stats else "No statistics available"}
                     Anomalies Detected:{anomaly_text}
-                    Recommendations:{recs_text}
+                    Recommendations:{json.dumps(recommendations, indent =2)}
+                    Weather: {weather_data_str}
 
                     Generate a well-structured, easy-to-read final report that:
-                    1. Summarizes the current weather situation
+                    1. Summarizes the current weather situation, Describe how it feels (cold/warm), whether it's windy, rainy, or sunny.
                     2. Explains the analysis findings
                     3. Highlights any anomalies or unusual patterns
                     4. Provides clear, actionable recommendations

@@ -29,7 +29,7 @@ llm = ChatGroq(
     temperature=0.2
 )
 
-# Option 2: Google Generative AI LLM (commented out)
+#Option 2: Google Generative AI LLM (commented out)
 # llm = ChatGoogleGenerativeAI(
 #     model=model,
 #     google_api_key=api_key,

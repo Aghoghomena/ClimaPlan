@@ -38,16 +38,6 @@ from langgraph.checkpoint.memory import MemorySaver
 from langchain_core.runnables import RunnableConfig
 
 
-
-def _cfg(config: RunnableConfig | None) -> dict:
-    return (config or {}).get("configurable", {}) or {}
-
-def _fmt(template: str, **kwargs) -> str:
-    # Safe .format with defaults
-    safe = {k: (v if v is not None else "") for k, v in kwargs.items()}
-    return template.format(**safe)
-
-
 # Configuration for file saving
 STORAGE_DIR = "data"  # Directory to save files
 FILE_FORMAT = "csv"  # Default format: csv, parquet, or json
@@ -105,118 +95,64 @@ checkpointer = MemorySaver()
 # -----------------------------
 # Create the weather retrieval graph
 async def create_graph():
-    """Create the graph after getting tools"""
     alltools = await mcp_client.get_tools()
-    # Filter tools to only include those we need to keep the graph efficient and not overloaded
+        # Filter tools to only include those we need to keep the graph efficient and not overloaded
     ALLOW = {"weather_archive", "geocoding", "get_user_location", "get_weather_for_today"}  # only what you need
     tools= [t for t in alltools if t.name in ALLOW]
-
-    # Debug: Print tools to verify they're loaded
-    # print(f"Loaded {len(tools)} tools:")
-    # for tool in tools:
-    #     print(f"  - {tool.name}: {tool.description}")
-
     tool_map = {tool.name: tool for tool in tools}
 
-    get_user_location_tool = tool_map["get_user_location"]
-    get_weather_for_today_tool = tool_map["get_weather_for_today"]
-    weather_archive_tool = tool_map["weather_archive"]
-
-    async def user_location(state: WeatherState) -> dict:
-
+    # ReAct Agent Node
+    async def reactagent(state: WeatherState) -> dict:
         try:
-            result = await get_user_location_tool.ainvoke({})
-            raw_data = result[0]["text"] if isinstance(result, list) else result
-            # Validate at this point
-            outcome = location_guard.parse(raw_data)
-            data = outcome.validated_output
-            return {
-                "latitude": data["latitude"],
-                "longitude": data["longitude"],
-                "city": data["city"],
-                "country": data["country"],
-                "Error": None
-            }
-        except (json.JSONDecodeError, ValidationError, ValueError) as e:
-        # structured error you can route on
-            return {
-                "Error": f"user_location validation failed: {str(e)}",
-                "guard_ok": False,
-                "guard_notes": [str(e)],
-            }
-        
-        except Exception as e:
-            print(f"Error in user_location: {e}")
-            import traceback
-            traceback.print_exc()
-            return {"Error":  f"Error in user_location: {e}"}
-
-    
-    async def get_weather_for_today(state: WeatherState) -> dict:
-        try:
-            raw = await get_weather_for_today_tool.ainvoke({
-                "latitude": state.latitude,
-                "longitude": state.longitude
-            })
-            data = raw[0] if isinstance(raw, list) else raw
-
-            return {
-                "today_weather": data,
-                "Error": None  # Clear any previous error
-            }
-        except Exception as e:
-            print(f"Error in get_weather_for_today: {e}")
-            import traceback
-            traceback.print_exc()
-            return {"Error":  f"Error in get_weather_for_today: {e}"}
-
-    
-
-    async def get_historical_data(state: WeatherState) -> dict:
-        
-        try:
-
-            # Get latitude and longitude from state
-            user_latitude = state.latitude
-            user_longitude = state.longitude
-
-            if user_latitude is None or user_longitude is None:
-                # If we don't have location yet, return empty (shouldn't happen in normal flow)
-                return {"Error": "Missing latitude/longitude"}
+            # Get tools for the agent
+            tools = [tool_map["get_user_location"], tool_map["get_weather_for_today"]]
             
-            # Calculate dates (last 7 days)
-            #end_date = "2025-12-31" #using this date because they dont have the correct date yet
-            end_date = datetime.now().strftime('%Y-%m-%d')
-            start_date = (datetime.now() - timedelta(days=365 * 10)).strftime('%Y-%m-%d')
-            # Call the tool programmatically
-            tool_out = await weather_archive_tool.ainvoke({
-                    "latitude": user_latitude,
-                    "longitude": user_longitude,
-                    "daily": [
-                        "temperature_2m_max",
-                        "temperature_2m_min",
-                        "precipitation_sum",
-                        "wind_speed_10m_max",
-                        "shortwave_radiation_sum"
-                        ],
-                    "start_date":start_date,
-                    "end_date": end_date,
-                    "temperature_unit": "celsius",
-                    "timezone": "Europe/Dublin",
-                    
-            })
-            # tool_out might be list[{"type":"text","text":"..."}] or a ToolMessage.
-
-            data = parse_mcp(tool_out)               # dict
-            df = weather_data_to_df(data)           # your helper
-            records = df.to_dict(orient="records")  # serialize-friendlye
-
-            return {"hist_weather": df, "Error": None}
-
+            # Bind tools to LLM
+            llm_with_tools = llm.bind_tools(tools)
+            
+            # Invoke LLM with current state
+            response = await llm_with_tools.ainvoke(state.messages)
+            
+            return {"messages": [response], "Error": None}
         except Exception as e:
-            print(f"Error calling weather_archive: {e}")
-            return {"Error": f"Error calling weather_archive: {e}"}
-
+            # Handle any other errors
+            error_msg = f"Error in agent node: {str(e)}"
+            print(f"Error in agent: {e}")
+            import traceback
+            traceback.print_exc()
+            return {
+                "Error": error_msg,
+                "messages": state.messages
+            }
+        
+    
+    # Router function for ReAct pattern
+    def should_continue(state: WeatherState) -> str:
+        """Route based on whether the agent wants to use tools or finish"""
+        messages = state.messages
+        last_message = messages[-1]
+        
+        # If the last message has tool calls, route to tools
+        if hasattr(last_message, 'tool_calls') and last_message.tool_calls:
+            return "tools"
+        
+        # Check for errors first
+        if state.Error:
+            return "error_handler"
+        
+        messages = state.messages
+        if not messages:
+            return "error_handler"
+        # If no tool calls and we have weather data, proceed to next steps
+        if state.today_weather:
+            return "continue"
+        
+        # If no tool calls but missing data, end (or route to error)
+        if state.Error:
+            return "error_handler"
+        
+        # Default: continue to next step
+        return "continue"
 
     
     # Error handler node to provide a fallback message
@@ -226,21 +162,6 @@ async def create_graph():
         )
         return {"messages": [msg]}
 
-
-    # Format response node to create a human-readable weather summary
-    async def format_response(state: WeatherState) -> dict:
-        """Format the weather data into human-readable format"""
-        weather_data = state.today_weather
-        city = state.city
-        country = state.country
-
-        # Create a prompt that includes the weather data and asks for formatting
-        formatted_result = await llm.ainvoke([format_weather_prompt(city=city, country=country, weather_data=weather_data)])
-         # Extract the content from the LLM response
-        formatted_content = formatted_result.content if hasattr(formatted_result, 'content') else str(formatted_result)
-    
-        return {"messages": [formatted_result],"formated_today_weather": formatted_content  }
-    
     async def trim_message(state: WeatherState) -> dict:
          # Convert messages to dict format (JSON serializable)
         messages_content = []
@@ -295,15 +216,17 @@ async def create_graph():
                 # Pass only weather data
                 result = recommend_graph.invoke({
                     "today_weather": state.today_weather,
-                    "formated_today_weather": state.formated_today_weather
                 })
                 
                 # Extract recommendations from the subgraph result
                 # Since recommend_for_weather already updated the state, extract it
+                recommendation_state = RecommendationState.model_validate(result)
                 final_recommendations = result.get("final_recommendations", [])
+                
                 
                 return {
                     "recommendations": final_recommendations,
+                    "recommendation_state": recommendation_state,
                     "Error": result.get("Error")
                 }
             except Exception as e:
@@ -334,8 +257,9 @@ async def create_graph():
                 anomaly_text = "No significant anomalies detected"
 
             # Generate final output using LLM
-            final_result = await llm.ainvoke([HumanMessage(content=get_final_output_prompt(location=location, analysis=analysis, stats=analysis, anomaly=anomaly_text, recommendations= recs_text))])
+            final_result = await llm.ainvoke([HumanMessage(content=get_final_output_prompt(location=location, analysis=analysis, stats=analysis, anomaly=anomaly_text, recommendations= recs_text, weather_data= state.today_weather))])
             final_content = final_result.content if hasattr(final_result, 'content') else str(final_result)
+            print(f"The weather details are: {final_content}")
             return{"final_output": final_content,
                    "messages": [HumanMessage(content=final_content)]}
         except Exception as e:
@@ -350,38 +274,112 @@ async def create_graph():
                 }
         }
             
+    async def process_tool_results(state: WeatherState) -> dict:
+        """Process tool results and update state"""
+        messages = state.messages
+        updates = {"Error": None}
+        
+        # Process tool messages and extract data
+        for msg in messages:
+                if not isinstance(msg, ToolMessage):
+                    continue
 
-    
+                tool_name = getattr(msg, "name", "") or ""
+                
+                # Parse tool results
+                if "get_user_location" in tool_name:
+                    try:
+                        raw_data = msg.content[0]["text"]
+                        outcome = location_guard.parse(raw_data)
+                        data = outcome.validated_output
+                        updates.update({
+                            "latitude": data["latitude"],
+                            "longitude": data["longitude"],
+                            "city": data["city"],
+                            "country": data["country"],
+                            "Error": None
+                        })
+                    except Exception as e:
+                        updates["Error"] = f"Error processing location: {e}"
+                
+                elif "get_weather_for_today" in tool_name:
+                    try:
+                        raw_text = msg.content[0]["text"]
+                        updates["today_weather"] = json.loads(raw_text)
+                    except Exception as e:
+                        updates["Error"] = f"Error processing weather: {e}"
+        #print(f"process_tool_results returning updates: {list(updates.keys())}")
+        return updates
+
+
+# will leave this as a node becaus of the API call structure
+    async def get_historical_data(state: WeatherState) -> dict:
+        
+        try:
+            weather_archive_tool = tool_map["weather_archive"]
+            user_latitude = state.latitude
+            user_longitude = state.longitude
+
+            if user_latitude is None or user_longitude is None:
+                # If we don't have location yet, return empty (shouldn't happen in normal flow)
+                return {"Error": "Missing latitude/longitude"}
+            end_date = datetime.now().strftime('%Y-%m-%d')
+            start_date = (datetime.now() - timedelta(days=365 * 10)).strftime('%Y-%m-%d')
+            # Call the tool programmatically
+            tool_out = await weather_archive_tool.ainvoke({
+                    "latitude": user_latitude,
+                    "longitude": user_longitude,
+                    "daily": [
+                        "temperature_2m_max",
+                        "temperature_2m_min",
+                        "precipitation_sum",
+                        "wind_speed_10m_max",
+                        "shortwave_radiation_sum"
+                        ],
+                    "start_date":start_date,
+                    "end_date": end_date,
+                    "temperature_unit": "celsius",
+                    "timezone": "Europe/Dublin",
+                    
+            })
+
+            data = parse_mcp(tool_out)               # dict
+            df = weather_data_to_df(data)           # your helper
+        
+            return {"hist_weather": df, "Error": None}
+
+        except Exception as e:
+            print(f"Error calling weather_archive: {e}")
+            return {"Error": f"Error calling weather_archive: {e}"}
+
 
     weather_graph = StateGraph(WeatherState)
-    weather_graph.add_node("get_location", user_location)
-    weather_graph.add_node("get_weather", get_weather_for_today)
-    weather_graph.add_node("weather_history", get_historical_data)
-    weather_graph.add_node("format_response", format_response)
+    weather_graph.add_node("agent", reactagent)
+    weather_graph.add_node("tools", ToolNode(tools=[tool_map["get_user_location"], tool_map["get_weather_for_today"], tool_map["weather_archive"]]))
+    weather_graph.add_node("process_results", process_tool_results)
     weather_graph.add_node("error_handler", error_handler)
     weather_graph.add_node("trim_message", trim_message)
     weather_graph.add_node("persist_data", persist_graph)
     weather_graph.add_node("recommend", call_recommendation)
     weather_graph.add_node("final_output", final_output)  
+    weather_graph.add_node("weather_history", get_historical_data)
 
-    weather_graph.add_edge(START, "get_location")
-    # After each node, check for errors
+    weather_graph.add_edge(START, "agent")
     weather_graph.add_conditional_edges(
-        "get_location",
-        check_for_errors,
-        path_map={"error_handler": "error_handler", "continue": "get_weather"}
+        "agent",
+        should_continue,
+        {
+            "tools": "tools",
+            "continue": "weather_history",
+            "error_handler": "error_handler"
+        }
     )
-    weather_graph.add_conditional_edges(
-    "get_weather",
-    check_for_errors,
-    path_map={"error_handler": "error_handler", "continue": "weather_history"}
-    )
-    weather_graph.add_conditional_edges(
-        "weather_history",
-        check_for_errors,
-        path_map={"error_handler": "error_handler", "continue": "format_response"}
-    )
-    weather_graph.add_edge("format_response", "trim_message")
+    # Tools always go to process_results
+    weather_graph.add_edge("tools", "process_results")
+
+    # Process results goes back to agent (to continue ReAct loop)
+    weather_graph.add_edge("process_results", "agent")
+    weather_graph.add_edge("weather_history", "trim_message")
     weather_graph.add_edge("trim_message", "persist_data")
     weather_graph.add_edge("persist_data", "recommend")
     weather_graph.add_edge("recommend", "final_output") 
@@ -415,6 +413,7 @@ def save_file(state: WeatherAnalysis, str = FILE_FORMAT, storage_dir: str = STOR
             return {"hist_file_path": path, "Error": None}
         except Exception as e:
             return {"Error": f"persist_subgraph failed: {e}"}
+
         
 # get analysis Data
 def analyse_data(state: WeatherAnalysis) -> dict:
@@ -545,49 +544,10 @@ def process_execution_results(state: WeatherAnalysis) -> dict:
                 "stats": None
             }
 
-def generate_code_node(state: WeatherAnalysis, config: RunnableConfig = None) -> dict:
-    try:
-        """Generate Python code based on the historical weather baseline and return the generated code."""
-        # Get messages from state, or create initial messages if empty
-
-        cfg = _cfg(config)
-
-        # overrideable prompt pieces
-        code_system_prompt = cfg.get("code_system_prompt") or get_prompt_subgraph2()
-        code_human_prompt_tmpl = cfg.get(
-            "code_human_prompt",
-            "Understand the dataset at {hist_file_path} and generate Python code only (no comments). "
-            "Your code MUST set a JSON-serializable dict named RESULT."
-        )
-        if not state.messages:
-            msgs= [
-            SystemMessage(content=code_system_prompt),
-            HumanMessage(content=_fmt(code_human_prompt_tmpl, hist_file_path=state.hist_file_path))
-        ]
-
-        else:
-            msgs = state.messages
-
-        # Bind the tool to the LLM so it can make tool calls
-        llm_with_tools = llm.bind_tools([execute_code])
-
-        result = llm_with_tools.invoke(msgs)
-        updated_messages = msgs + [result]
-        return {
-            "messages": updated_messages,
-            "generated_code":json.dumps(re.sub(r"```.*?\n|```", "", result.content).strip()),
-        }
-    except Exception as e:
-        error_msg = f"Failed at generate code: {e}"
-        return {
-                "last_error": error_msg,
-        }
-
-    
-    
 import contextlib
 import io
 @tool
+@traceable(name='execute_code')
 def execute_code(code: str) -> str:
     """
     Execute Python code and return the results as a JSON string.
@@ -626,12 +586,45 @@ def execute_code(code: str) -> str:
     except Exception as e:
         return json.dumps({"error": str(e)})
 
+def generate_code_node(state: WeatherAnalysis) -> dict:
+    try:
+        """Generate Python code based on the historical weather baseline and return the generated code."""
+        # Get messages from state, or create initial messages if empty
+
+        
+        if not state.messages:
+            msgs= [
+            SystemMessage(content=get_prompt_subgraph2()),
+            HumanMessage(content=f" Understand the data stored in :{state.hist_file_path} and generate Python code, no comments ")
+        ]
+
+        else:
+            msgs = state.messages
+
+        # Bind the tool to the LLM so it can make tool calls
+        llm_with_tools = llm.bind_tools([execute_code])
+
+        result = llm_with_tools.invoke(msgs)
+        updated_messages = msgs + [result]
+
+        return {
+            "messages": updated_messages,
+            "generated_code":json.dumps(re.sub(r"```.*?\n|```", "", result.content).strip()),
+        }
+    except Exception as e:
+        error_msg = f"Failed at generate code: {e}"
+        return {
+                "last_error": error_msg,
+        }
+
+
 # Add this new prompt if 
 # Add this function before subgraph2 definition (around line 673)
 def compute_baseline_directly(state: WeatherAnalysis) -> dict:
     """After 3 retries failed, ask LLM to compute baseline directly from the file path"""
     try:
         # Use LLM with structured output
+        
         structured_llm = llm.with_structured_output(WeatherAnalysisOutPut)
         
         result = structured_llm.invoke([
@@ -716,10 +709,9 @@ except Exception as e:
 # -----------------------------
 # SUBGRAPH 4 Recommendation and Reflection
 # -----------------------------
-def recommend_for_weather(state: RecommendationState, config: RunnableConfig= None)-> dict:
+def recommend_for_weather(state: RecommendationState)-> dict:
         try:
             """Recommend activities the graph after getting tools"""
-            cfg = _cfg(config)
             weather_data = parse_mcp(state.today_weather)
             # Handle case where today_weather might be a string or None
             if weather_data is None:
@@ -727,9 +719,7 @@ def recommend_for_weather(state: RecommendationState, config: RunnableConfig= No
                     "Error": "No weather data available",
                     "recommendations": []
                 }
-            rec_prompt = cfg.get("recommendation_prompt")
-            prompt = _fmt(rec_prompt,get_recommendation_prompt(weather_data=weather_data))
-            out: Recommendation = llm.with_structured_output(Recommendation).invoke(prompt)
+            out: Recommendation = llm.with_structured_output(Recommendation).invoke(get_recommendation_prompt(weather_data=weather_data))
             # Update state using attribute access (Pydantic model)
             return {
                 "original_recommendations": out
@@ -741,16 +731,15 @@ def recommend_for_weather(state: RecommendationState, config: RunnableConfig= No
             }
 
 #reflect on the recommendations 
-def reflect_on_recommendations(state: RecommendationState, config = RunnableConfig = None) -> dict:
+def reflect_on_recommendations(state: RecommendationState) -> dict:
     try:
-        cfg = _cfg(config)
-        
         if state.original_recommendations is None:
             return {
                 "Error": "No original recommendations to reflect on"
             }
         orig = state.original_recommendations
-        out: Reflections = llm.with_structured_output(Reflections).invoke(get_reflection_prompt(formated_today_weather=state.formated_today_weather, original_recommendations=orig))
+
+        out: Reflections = llm.with_structured_output(Reflections).invoke(get_reflection_prompt(weather_data=state.today_weather, original_recommendations=orig))
               # Create a message asking user if they want to apply the reflection
         reflection_message = f"""
                             Reflection completed. Here's what was improved:

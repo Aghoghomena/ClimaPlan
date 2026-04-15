@@ -4,27 +4,7 @@ from langchain.messages import AnyMessage
 from langgraph.graph.message import add_messages
 
 
-#Contains all the classes used
-class WeatherState(BaseModel):
-    retries: int = 0
-    messages: Annotated[list[AnyMessage], add_messages] = []
-    latitude: Optional[float] = None
-    longitude: Optional[float] = None
-    city: str | None = None
-    country: str | None = None
-    today_weather: Optional[Dict[str, Any]] = None
-    formated_today_weather: str | None = None
-    hist_weather: Optional[Any] = None  # keep flexible (list/dict) depending on your MCP tool
-    ready_to_format: bool = False 
-    Error: str | None = None
-    generated_code: str | None = None
-    analysis: str | None = None
-    anomaly: Optional[Dict[str, Any]] = None
-    stats: Optional[Dict[str, Any]] = None
-    recommendations: Optional[List[str]] = None
-    final_output: str | None = None
-    # final strict output (as dict)
-    final: Optional[Dict[str, Any]] = None
+
 
 
 class UserLocationSchema(BaseModel):
@@ -79,3 +59,38 @@ class RecommendationState(BaseModel):
     reflection_notes: Optional[str] = None
     messages: Annotated[list[AnyMessage], add_messages] = []
     Error: Optional[str] = None
+
+
+#Contains all the classes used
+class WeatherState(BaseModel):
+    retries: int = 0
+    messages: Annotated[list[AnyMessage], add_messages] = []
+    latitude: Optional[float] = None
+    longitude: Optional[float] = None
+    city: str | None = None
+    country: str | None = None
+    today_weather: Optional[Dict[str, Any]] = None
+    formated_today_weather: str | None = None
+    hist_weather: Optional[Any] = None  # keep flexible (list/dict) depending on your MCP tool
+    ready_to_format: bool = False 
+    Error: str | None = None
+    generated_code: str | None = None
+    analysis: str | None = None
+    anomaly: Optional[Dict[str, Any]] = None
+    stats: Optional[Dict[str, Any]] = None
+    recommendations: Optional[List[str]] = None
+    final_output: str | None = None
+    # final strict output (as dict)
+    final: Optional[Dict[str, Any]] = None
+    recommendation_state: Optional[RecommendationState] = None  # Add RecommendationState
+
+class CorrectnessEvalSchema(BaseModel):
+    """Schema for code quality evaluation."""
+    score: int = Field(description="An integer percentage score from 0 to 100 indicating correctness/quality.")
+    comment: str = Field(description="An extensive explanation of the score.")
+    failingscore: int = Field(description="0 to 100 indicating likelihood the code will fail.")
+
+
+class ReflectionQualitySchema(BaseModel):
+    score: int = Field(description="0-100 score for whether reflection improves the recommendation.")
+    comment: str = Field(description="Why this score; what improved/worsened; any issues.")
